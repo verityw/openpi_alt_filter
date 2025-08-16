@@ -31,11 +31,16 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        filter_dict_path = None,
+        filter_last_n_in_ranges = 10,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
         import tensorflow as tf
         import tensorflow_datasets as tfds
+
+        import json
+        from tqdm import tqdm
 
         # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
         tf.config.set_visible_devices([], "GPU")
@@ -52,6 +57,33 @@ class DroidRldsDataset:
 
         # Repeat dataset so we never run out of data.
         dataset = dataset.repeat()
+
+        # Load the filter dictionary if provided.
+        # The filter dictionary is a JSON file that maps episode keys to ranges of frames to keep
+        # (e.g., {"<episode key>": [[0, 100], [200, 300]]} means keep frames 0-99 and 200-299).
+        if filter_dict_path is not None:
+            print("Loading filter dictionary from:", filter_dict_path)
+            with open(filter_dict_path, "r") as f:
+                filter_dict = json.load(f)
+            keys_tensor = []
+            values_tensor = []
+
+            for episode_key, ranges in tqdm(filter_dict.items()):
+                for start, end in ranges:
+                    for t in range(start, end - filter_last_n_in_ranges):
+                        frame_key = f"{episode_key}--{t}"
+                        keys_tensor.append(frame_key)
+                        values_tensor.append(True)
+            self.filter_table = tf.lookup.StaticHashTable(
+                tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor),
+                default_value=False
+            )
+            print("Filter hash table initialized")
+        else:
+            self.filter_table = tf.lookup.StaticHashTable(
+                tf.lookup.KeyValueTensorInitializer([""], [True]),
+                default_value=True
+            )
 
         def restructure(traj):
             """Reformat observation and action keys, sample language instruction."""
@@ -80,6 +112,11 @@ class DroidRldsDataset:
                 [traj["language_instruction"], traj["language_instruction_2"], traj["language_instruction_3"]]
             )[0]
 
+            traj_len = tf.shape(traj["action"])[0]
+            indices = tf.as_string(tf.range(traj_len))
+            step_id = traj["traj_metadata"]["episode_metadata"]["recording_folderpath"] + "--" + traj["traj_metadata"]["episode_metadata"]["file_path"] + "--" + indices
+            passes_filter = self.filter_table.lookup(step_id)
+
             return {
                 "actions": actions,
                 "observation": {
@@ -89,6 +126,8 @@ class DroidRldsDataset:
                     "gripper_position": traj["observation"]["gripper_position"],
                 },
                 "prompt": instruction,
+                "step_id": step_id,
+                "passes_filter": passes_filter,
             }
 
         dataset = dataset.traj_map(restructure, num_parallel_calls)
@@ -119,17 +158,10 @@ class DroidRldsDataset:
         # Flatten: map from trajectory dataset to dataset of individual action chunks
         dataset = dataset.flatten(num_parallel_calls=num_parallel_calls)
 
-        # Filter out frames where actions are idle. Must be done after flattening, as filter should apply per-frame.
-        def filter_idle(traj):
-            """Filter out chunks with idle actions.
-            --> we filter if at least first half of chunk does not move.
-            """
-            if action_space == DroidActionSpace.JOINT_POSITION:
-                # Compute delta to first position in action chunk
-                return tf.reduce_any(tf.abs(traj["actions"][: action_chunk_size // 2] - traj["actions"][:1]) > 1e-3)
-            return tf.reduce_any(tf.abs(traj["actions"][: action_chunk_size // 2]) > 1e-3)
-
-        dataset = dataset.filter(filter_idle)
+        def filter_from_dict(frame):
+            return frame["passes_filter"]
+        
+        dataset = dataset.filter(filter_from_dict)
 
         # Decode images: RLDS saves encoded images, only decode now for efficiency
         def decode_images(traj):
